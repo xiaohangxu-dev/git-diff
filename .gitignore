@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+git-diff.zip
+.kuai.yaml
+settings.json

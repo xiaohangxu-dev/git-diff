@@ -5,12 +5,14 @@ git-diff 主脚本 - Git 修改总结工具
 功能:
     1. 总结修改: 对比源分支和当前分支的修改
     2. 指定范围总结: 列出 git log，选择 commit 范围进行 diff 总结
+    3. 合并 Review: 查看最近一次合并的详细信息，分析冲突解决和潜在风险
 
 Usage:
     python3 main.py --help
     python3 main.py summary [--source <branch>] [-o <file>]
     python3 main.py log [--limit <n>]
     python3 main.py diff --from <commit> [--to <commit>] [-o <file>]
+    python3 main.py merge-review [--commit <merge_commit>] [-o <file>]
 """
 
 import argparse
@@ -354,6 +356,381 @@ def cmd_log(args) -> int:
     return 0
 
 
+def find_latest_merge_commit() -> Optional[str]:
+    """查找最近一次 merge commit"""
+    # 使用 --merges 只筛选 merge commits
+    code, stdout, _ = run_git_command([
+        "log", "--merges", "-1", "--format=%H"
+    ])
+    if code == 0 and stdout.strip():
+        return stdout.strip()
+    return None
+
+
+def get_merge_parents(merge_commit: str) -> Optional[Tuple[str, str]]:
+    """获取 merge commit 的两个父 commit
+    
+    Returns:
+        (parent1, parent2) - parent1 通常是主分支，parent2 是被合并的分支
+    """
+    code, stdout, _ = run_git_command([
+        "rev-parse", f"{merge_commit}^1", f"{merge_commit}^2"
+    ])
+    if code == 0:
+        parents = stdout.strip().split('\n')
+        if len(parents) >= 2:
+            return (parents[0].strip(), parents[1].strip())
+    return None
+
+
+def get_commit_info(commit: str) -> dict:
+    """获取 commit 的详细信息"""
+    code, stdout, _ = run_git_command([
+        "log", "-1", "--format=%H|%h|%s|%an|%ad|%P",
+        "--date=short", commit
+    ])
+    if code == 0 and stdout.strip():
+        parts = stdout.strip().split('|')
+        if len(parts) >= 6:
+            return {
+                'hash': parts[0],
+                'short_hash': parts[1],
+                'subject': parts[2],
+                'author': parts[3],
+                'date': parts[4],
+                'parents': parts[5].split() if parts[5] else []
+            }
+    return {}
+
+
+def get_branch_name_for_commit(commit: str) -> str:
+    """尝试获取 commit 所属的分支名"""
+    # 尝试通过 reflog 或 branch --contains 获取
+    code, stdout, _ = run_git_command([
+        "branch", "-a", "--contains", commit
+    ])
+    if code == 0 and stdout.strip():
+        branches = [b.strip().lstrip('* ') for b in stdout.strip().split('\n')]
+        # 过滤掉 HEAD detached 等
+        branches = [b for b in branches if b and 'HEAD' not in b]
+        if branches:
+            return branches[0]
+    return commit[:8]
+
+
+def analyze_merge_conflicts(merge_commit: str, parent1: str, parent2: str) -> dict:
+    """分析合并中的冲突解决情况
+    
+    通过比较三方 diff 来识别可能的冲突文件和解决方式
+    """
+    result = {
+        'conflict_files': [],
+        'lost_changes': [],
+        'manual_resolutions': []
+    }
+    
+    # 获取 merge base（两个 parent 的共同祖先）
+    merge_base = get_merge_base(parent1, parent2)
+    if not merge_base:
+        return result
+    
+    # 获取 parent1 相对于 merge-base 修改的文件
+    code1, files1, _ = run_git_command([
+        "diff", "--name-only", f"{merge_base}..{parent1}"
+    ])
+    parent1_files = set(files1.strip().split('\n')) if code1 == 0 and files1.strip() else set()
+    
+    # 获取 parent2 相对于 merge-base 修改的文件
+    code2, files2, _ = run_git_command([
+        "diff", "--name-only", f"{merge_base}..{parent2}"
+    ])
+    parent2_files = set(files2.strip().split('\n')) if code2 == 0 and files2.strip() else set()
+    
+    # 两边都修改的文件（潜在冲突）
+    potential_conflicts = parent1_files & parent2_files
+    
+    for file in potential_conflicts:
+        if not file:
+            continue
+            
+        # 对每个潜在冲突文件，比较最终结果
+        conflict_info = {
+            'file': file,
+            'parent1_changes': '',
+            'parent2_changes': '',
+            'merge_result': '',
+            'resolution_type': 'unknown'
+        }
+        
+        # 获取 parent1 的修改
+        code, p1_diff, _ = run_git_command([
+            "diff", f"{merge_base}..{parent1}", "--", file
+        ])
+        if code == 0:
+            conflict_info['parent1_diff'] = p1_diff
+        
+        # 获取 parent2 的修改
+        code, p2_diff, _ = run_git_command([
+            "diff", f"{merge_base}..{parent2}", "--", file
+        ])
+        if code == 0:
+            conflict_info['parent2_diff'] = p2_diff
+        
+        # 获取最终 merge 结果相对于 merge-base 的变化
+        code, merge_diff, _ = run_git_command([
+            "diff", f"{merge_base}..{merge_commit}", "--", file
+        ])
+        if code == 0:
+            conflict_info['merge_diff'] = merge_diff
+        
+        # 分析解决方式
+        # 比较 merge 结果与各个 parent 的差异
+        code, diff_vs_p1, _ = run_git_command([
+            "diff", f"{parent1}..{merge_commit}", "--", file
+        ])
+        code, diff_vs_p2, _ = run_git_command([
+            "diff", f"{parent2}..{merge_commit}", "--", file
+        ])
+        
+        # 判断解决类型
+        if not diff_vs_p1.strip() and diff_vs_p2.strip():
+            conflict_info['resolution_type'] = 'kept_parent1'
+            conflict_info['risk'] = 'parent2 的修改可能被丢弃'
+            result['lost_changes'].append({
+                'file': file,
+                'lost_from': 'parent2',
+                'diff': p2_diff if 'p2_diff' in dir() else ''
+            })
+        elif not diff_vs_p2.strip() and diff_vs_p1.strip():
+            conflict_info['resolution_type'] = 'kept_parent2'
+            conflict_info['risk'] = 'parent1 的修改可能被丢弃'
+            result['lost_changes'].append({
+                'file': file,
+                'lost_from': 'parent1',
+                'diff': p1_diff if 'p1_diff' in dir() else ''
+            })
+        elif not diff_vs_p1.strip() and not diff_vs_p2.strip():
+            conflict_info['resolution_type'] = 'identical'
+        else:
+            conflict_info['resolution_type'] = 'manual_merge'
+            result['manual_resolutions'].append(conflict_info)
+        
+        result['conflict_files'].append(conflict_info)
+    
+    return result
+
+
+def cmd_merge_review(args) -> int:
+    """功能3: 合并 Review - 分析最近一次 merge 的详细情况"""
+    
+    # 确定要分析的 merge commit
+    merge_commit = args.commit
+    if not merge_commit:
+        merge_commit = find_latest_merge_commit()
+        if not merge_commit:
+            print("错误: 当前分支没有找到 merge commit", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("提示:", file=sys.stderr)
+            print("  1. 使用 --commit 指定 merge commit", file=sys.stderr)
+            print("  2. 使用 'git log --merges' 查看 merge 历史", file=sys.stderr)
+            return 1
+    
+    # 验证是否为 merge commit
+    commit_info = get_commit_info(merge_commit)
+    if not commit_info:
+        print(f"错误: 无法获取 commit '{merge_commit}' 的信息", file=sys.stderr)
+        return 1
+    
+    if len(commit_info.get('parents', [])) < 2:
+        print(f"错误: '{merge_commit}' 不是一个 merge commit", file=sys.stderr)
+        print("提示: merge commit 应该有两个 parent", file=sys.stderr)
+        return 1
+    
+    parents = get_merge_parents(merge_commit)
+    if not parents:
+        print(f"错误: 无法获取 merge commit 的 parent 信息", file=sys.stderr)
+        return 1
+    
+    parent1, parent2 = parents
+    
+    # 获取 parent 信息
+    parent1_info = get_commit_info(parent1)
+    parent2_info = get_commit_info(parent2)
+    
+    # 尝试获取分支名
+    parent1_branch = get_branch_name_for_commit(parent1)
+    parent2_branch = get_branch_name_for_commit(parent2)
+    
+    # 获取 merge base
+    merge_base = get_merge_base(parent1, parent2)
+    
+    # 确定输出路径
+    output_path = args.output if args.output else get_default_output_path(merge_base or parent1, merge_commit)
+    out = OutputWriter(output_path)
+    
+    try:
+        out.write("# Merge Review 报告")
+        out.write()
+        out.write(f"> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        out.write()
+        
+        # 基本信息
+        out.write("## 合并信息")
+        out.write()
+        out.write("| 项目 | 值 |")
+        out.write("| --- | --- |")
+        out.write(f"| Merge Commit | `{commit_info['short_hash']}` |")
+        out.write(f"| 提交信息 | {commit_info['subject']} |")
+        out.write(f"| 作者 | {commit_info['author']} |")
+        out.write(f"| 日期 | {commit_info['date']} |")
+        out.write(f"| Parent 1 (主分支) | `{parent1[:8]}` ({parent1_branch}) |")
+        out.write(f"| Parent 2 (被合并) | `{parent2[:8]}` ({parent2_branch}) |")
+        if merge_base:
+            out.write(f"| Merge Base | `{merge_base[:8]}` |")
+        out.write()
+        
+        # 分析冲突解决
+        out.write("## 冲突分析")
+        out.write()
+        
+        conflict_analysis = analyze_merge_conflicts(merge_commit, parent1, parent2)
+        
+        if not conflict_analysis['conflict_files']:
+            out.write("✅ 无冲突文件（两个分支修改了不同的文件）")
+        else:
+            out.write(f"⚠️ 发现 **{len(conflict_analysis['conflict_files'])}** 个潜在冲突文件（两边都有修改）")
+            out.write()
+            out.write("| 文件 | 解决方式 | 风险等级 |")
+            out.write("| --- | --- | --- |")
+            
+            for cf in conflict_analysis['conflict_files']:
+                resolution = cf['resolution_type']
+                if resolution == 'kept_parent1':
+                    resolution_text = "保留主分支"
+                    risk = "⚠️ 中"
+                elif resolution == 'kept_parent2':
+                    resolution_text = "保留被合并分支"
+                    risk = "⚠️ 中"
+                elif resolution == 'identical':
+                    resolution_text = "相同修改"
+                    risk = "✅ 低"
+                else:
+                    resolution_text = "手动合并"
+                    risk = "🔍 需检查"
+                
+                out.write(f"| `{cf['file']}` | {resolution_text} | {risk} |")
+        out.write()
+        
+        # 风险提示
+        out.write("## 风险提示")
+        out.write()
+        
+        if conflict_analysis['lost_changes']:
+            out.write("### ⚠️ 可能丢失的修改")
+            out.write()
+            out.write("以下文件在合并时，一方的修改可能被完全覆盖：")
+            out.write()
+            for lost in conflict_analysis['lost_changes']:
+                out.write(f"- `{lost['file']}`: {lost['lost_from']} 的修改可能被丢弃")
+            out.write()
+        else:
+            out.write("✅ 未发现明显的代码丢失风险")
+            out.write()
+        
+        if conflict_analysis['manual_resolutions']:
+            out.write("### 🔍 需要人工检查的文件")
+            out.write()
+            out.write("以下文件经过手动合并，建议检查合并结果是否正确：")
+            out.write()
+            for mr in conflict_analysis['manual_resolutions']:
+                out.write(f"- `{mr['file']}`")
+            out.write()
+        
+        # Parent1 的修改（主分支）
+        out.write(f"## Parent 1 修改（{parent1_branch}）")
+        out.write()
+        if merge_base:
+            code, stdout, _ = run_git_command([
+                "diff", "--stat", f"{merge_base}..{parent1}"
+            ])
+            if code == 0 and stdout.strip():
+                out.write("```")
+                out.write(stdout.rstrip())
+                out.write("```")
+            else:
+                out.write("_(无修改)_")
+        out.write()
+        
+        # Parent2 的修改（被合并分支）
+        out.write(f"## Parent 2 修改（{parent2_branch}）")
+        out.write()
+        if merge_base:
+            code, stdout, _ = run_git_command([
+                "diff", "--stat", f"{merge_base}..{parent2}"
+            ])
+            if code == 0 and stdout.strip():
+                out.write("```")
+                out.write(stdout.rstrip())
+                out.write("```")
+            else:
+                out.write("_(无修改)_")
+        out.write()
+        
+        # 最终合并结果
+        out.write("## 合并结果统计")
+        out.write()
+        if merge_base:
+            code, stdout, _ = run_git_command([
+                "diff", "--stat", f"{merge_base}..{merge_commit}"
+            ])
+            if code == 0 and stdout.strip():
+                out.write("```")
+                out.write(stdout.rstrip())
+                out.write("```")
+            else:
+                out.write("_(无变更)_")
+        
+        # 详细 diff 输出到控制台供 AI 分析
+        out.write_console_only()
+        out.write_console_only("## 详细变更内容")
+        out.write_console_only()
+        
+        # 输出潜在冲突文件的三方对比
+        if conflict_analysis['conflict_files']:
+            out.write_console_only("### 冲突文件详细对比")
+            out.write_console_only()
+            
+            for cf in conflict_analysis['conflict_files']:
+                out.write_console_only(f"#### 文件: `{cf['file']}` (解决方式: {cf['resolution_type']})")
+                out.write_console_only()
+                
+                if cf.get('parent1_diff'):
+                    out.write_console_only(f"**Parent 1 ({parent1_branch}) 的修改:**")
+                    out.write_console_only("```diff")
+                    out.write_console_only(cf['parent1_diff'].rstrip())
+                    out.write_console_only("```")
+                    out.write_console_only()
+                
+                if cf.get('parent2_diff'):
+                    out.write_console_only(f"**Parent 2 ({parent2_branch}) 的修改:**")
+                    out.write_console_only("```diff")
+                    out.write_console_only(cf['parent2_diff'].rstrip())
+                    out.write_console_only("```")
+                    out.write_console_only()
+                
+                if cf.get('merge_diff'):
+                    out.write_console_only("**最终合并结果:**")
+                    out.write_console_only("```diff")
+                    out.write_console_only(cf['merge_diff'].rstrip())
+                    out.write_console_only("```")
+                    out.write_console_only()
+        
+    finally:
+        out.close()
+    
+    return 0
+
+
 def cmd_diff(args) -> int:
     """功能2: 指定 commit 范围进行 diff"""
     from_commit = args.from_commit
@@ -462,6 +839,8 @@ def main():
   %(prog)s log --limit 50                  # 列出最近 50 条 commit
   %(prog)s diff --from abc123              # 从指定 commit 到 HEAD
   %(prog)s diff --from abc123 -o diff.md   # 输出到指定文件
+  %(prog)s merge-review                    # 分析最近一次 merge
+  %(prog)s merge-review --commit abc123    # 分析指定 merge commit
 """
     )
     
@@ -521,6 +900,20 @@ def main():
         help=f"输出文件路径（默认: {DEFAULT_OUTPUT_DIR}/changes_<timestamp>.md）"
     )
     
+    # merge-review 子命令
+    merge_parser = subparsers.add_parser(
+        "merge-review",
+        help="分析最近一次 merge 的详细情况，检查冲突解决和潜在风险"
+    )
+    merge_parser.add_argument(
+        "--commit", "-c",
+        help="指定要分析的 merge commit（默认: 最近一次 merge）"
+    )
+    merge_parser.add_argument(
+        "--output", "-o",
+        help=f"输出文件路径（默认: {DEFAULT_OUTPUT_DIR}/merge_review_<timestamp>.md）"
+    )
+    
     args = parser.parse_args()
     
     if args.command == "summary":
@@ -529,6 +922,8 @@ def main():
         return cmd_log(args)
     elif args.command == "diff":
         return cmd_diff(args)
+    elif args.command == "merge-review":
+        return cmd_merge_review(args)
     else:
         parser.print_help()
         return 0

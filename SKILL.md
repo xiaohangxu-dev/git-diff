@@ -104,7 +104,7 @@ cd <项目根目录> && python3 <SKILL_DIR>/scripts/main.py diff --from abc1234 
 
 ### 输出格式
 
-**先输出整体总结，再按文件输出详细变更**
+**先输出整体总结，再按文件输出详细变更，最后列出风险提示和待确认事项**
 
 ---
 
@@ -127,8 +127,26 @@ cd <项目根目录> && python3 <SKILL_DIR>/scripts/main.py diff --from abc1234 
 
 | 文件路径 | 文件总结 |
 | --- | --- |
+| entity/proto/qarobot.proto | 新增 `needQuestionClassId` 请求字段和 `questionClassId` 响应字段 |
+| go.mod | 升级 qarobotgo v1.1.93→v1.1.94；新增 knowledge_guide_server v1.0.26 依赖 |
 | service/qarobot_go.go | 将 CreateQA 请求中的 AppId 和 PartnerId 参数改为使用 req.AppId 而非 appid |
-| logic/MisiQarobotByHunYun/OnceQuestionStream.go | 导入 time 包并调整包顺序；新增提前获取问题分类ID逻辑，失败时不影响主流程；修改 callQuestionStream 签名，增加 questionClassId 参数；修改 recordOnceQuestionStreamAsync 签名，增加 cachedQuestionClassId 参数；记录日志时优先使用缓存分类ID，减少重复调用；扩展 questionStreamAdapter 结构体，新增 questionClassId 字段；在最终流包附加问题分类ID并记录日志 |
+| logic/.../OnceQuestionStream.go | 导入 time 包；新增提前获取问题分类ID逻辑；修改函数签名；扩展结构体 |
+
+#### 风险提示
+
+| 风险等级 | 风险描述 | 影响范围 | 建议 |
+| --- | --- | --- | --- |
+| ⚠️ 中 | Proto 新增字段需确认上下游兼容性 | `OnceQuestionStreamReq`、`OnceReplyStreamMeta` | 确认调用方是否已更新 proto 定义 |
+| ⚠️ 中 | 依赖版本升级 qarobotgo v1.1.93→v1.1.94 | 整体服务 | 检查 changelog 确认无 breaking change |
+| 🔴 高 | AppId 参数来源变更可能影响现有逻辑 | `CreateQA` 请求 | 确认 `req.AppId` 与原 `appid` 变量值一致 |
+
+#### 待确认事项
+
+| 序号 | 事项 | 原因 | 负责人 |
+| --- | --- | --- | --- |
+| 1 | `needQuestionClassId` 字段默认值行为 | 新增 bool 字段默认 false，老客户端不传时不会获取分类 ID | - |
+| 2 | `QuestionTagsOnlyClass` 接口超时配置 | 新增的前置调用可能增加整体耗时 | - |
+| 3 | 分类 ID 获取失败时的降级策略是否符合预期 | 当前策略为打日志继续，不影响主流程 | - |
 
 ---
 
@@ -150,6 +168,21 @@ cd <项目根目录> && python3 <SKILL_DIR>/scripts/main.py diff --from abc1234 
 | --- | --- |
 | path/to/file1.go | [该文件的具体修改点，用分号分隔多个修改] |
 | path/to/file2.go | [该文件的具体修改点] |
+
+#### 风险提示
+
+| 风险等级 | 风险描述 | 影响范围 | 建议 |
+| --- | --- | --- | --- |
+| 🔴 高 | [严重风险，可能导致线上问题] | [影响的模块/接口] | [处理建议] |
+| ⚠️ 中 | [需要关注的风险] | [影响范围] | [处理建议] |
+| 💡 低 | [轻微风险或优化建议] | [影响范围] | [处理建议] |
+
+#### 待确认事项
+
+| 序号 | 事项 | 原因 | 负责人 |
+| --- | --- | --- | --- |
+| 1 | [需要确认的事项] | [为什么需要确认] | - |
+| 2 | [需要确认的事项] | [为什么需要确认] | - |
 ```
 
 ### 总结要求
@@ -158,6 +191,25 @@ cd <项目根目录> && python3 <SKILL_DIR>/scripts/main.py diff --from abc1234 
 2. **文件详情**：按文件路径列表，每个文件总结其具体修改内容
 3. **表达清晰**：使用技术术语准确描述，如"签名"、"参数"、"结构体"等
 4. **逻辑分组**：相关的修改点放在一起描述
+5. **风险分析**：识别潜在风险，按严重程度分级
+6. **待确认事项**：列出需要人工确认的问题点
+
+### 风险识别要点
+
+分析代码变更时，重点关注以下风险类型：
+
+| 风险类型 | 触发条件 | 风险等级 |
+| --- | --- | --- |
+| **接口变更** | Proto/API 新增/删除/修改字段 | 中-高 |
+| **依赖变更** | go.mod/package.json 版本升级或新增依赖 | 中 |
+| **参数来源变更** | 函数参数、变量来源发生变化 | 高 |
+| **并发安全** | 涉及共享变量、锁、goroutine | 高 |
+| **错误处理** | 新增调用但未处理错误，或改变错误处理逻辑 | 中-高 |
+| **性能影响** | 新增同步调用、循环内操作、大对象拷贝 | 中 |
+| **配置变更** | 修改配置项、环境变量、默认值 | 中 |
+| **数据库操作** | SQL 变更、索引、事务范围 | 高 |
+| **安全相关** | 认证、鉴权、敏感数据处理 | 高 |
+| **兼容性** | 新增字段默认值、老客户端行为 | 中 |
 
 ---
 

@@ -31,15 +31,49 @@ python3 scripts/main.py log
 
 # 功能2: 指定范围 diff
 python3 scripts/main.py diff --from <commit>
+
+# 功能3: 合并 Review（分析最近一次 merge）
+python3 scripts/main.py merge-review
 ```
 
 ## 💻 IDE 命令使用
 
-在支持的 IDE（如 CodeBuddy）中，可以通过 `/gitDiffSummary` 命令快速调用：
+### 安装命令到 CodeBuddy
+
+将 `cmd/` 目录下的命令文件复制到 CodeBuddy 的用户命令目录：
+
+```bash
+# macOS / Linux
+cp cmd/*.md ~/.codebuddy/commands/
+
+# Windows
+copy cmd\*.md %USERPROFILE%\.codebuddy\commands\
+```
+
+复制后重启 CodeBuddy 或刷新命令列表即可使用。
+
+### 可用命令
+
+| 命令 | 说明 | 文件 |
+| --- | --- | --- |
+| `/gitDiffSummary` | 总结当前分支相对于源分支的修改 | `cmd/gitDiffSummary.md` |
+| `/gitMergeReview` | 分析最近一次 merge 的冲突和风险 | `cmd/gitMergeReview.md` |
+
+### 使用示例
 
 ```
+# 总结当前分支修改（自动识别源分支）
 /gitDiffSummary
+
+# 指定源分支
 /gitDiffSummary main
+/gitDiffSummary master
+
+# 分析最近一次 merge
+/gitMergeReview
+
+# 分析指定的 merge commit
+/gitMergeReview abc1234
 ```
 
 ### 输出示例
@@ -126,6 +160,25 @@ python3 scripts/main.py diff --from abc1234
 python3 scripts/main.py diff --from abc1234 --to def5678
 ```
 
+### 功能三：合并 Review
+
+分析最近一次 merge commit 的详细情况，检查冲突解决和潜在风险：
+
+```bash
+# 分析最近一次 merge
+python3 scripts/main.py merge-review
+
+# 分析指定 merge commit
+python3 scripts/main.py merge-review --commit abc1234
+```
+
+**输出内容：**
+- 合并基本信息（merge commit、两个 parent、merge base）
+- 冲突分析（哪些文件两边都有修改）
+- 风险提示（被丢弃的代码、需要检查的手动合并）
+- 各分支的修改统计
+- 详细 diff 供 AI 分析
+
 ## 💡 使用指南
 
 详细使用说明请参考 [使用指南](references/guide.md)。
@@ -136,8 +189,9 @@ python3 scripts/main.py diff --from abc1234 --to def5678
 git-diff/
 ├── SKILL.md          # Skill 入口文档
 ├── README.md         # 详细说明
-├── cmd/              # IDE 命令
-│   └── gitDiffSummary.md  # /gitDiffSummary 命令
+├── cmd/              # IDE 命令（复制到 ~/.codebuddy/commands/）
+│   ├── gitDiffSummary.md   # /gitDiffSummary 命令
+│   └── gitMergeReview.md   # /gitMergeReview 命令
 ├── scripts/          # 脚本工具
 │   └── main.py       # 主脚本
 ├── references/       # 参考文档
@@ -151,6 +205,7 @@ git-diff/
 
 | 版本  | 日期       | 主要变更     |
 | ----- | ---------- | ------------ |
+| 1.1.0 | 2026-02-04 | 新增 merge-review 命令，支持合并分析 |
 | 1.0.0 | 2026-02-03 | 初始版本，支持 summary/log/diff 命令 |
 
 ## 📄 许可证
